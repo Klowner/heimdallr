@@ -1,0 +1,201 @@
+#!/usr/bin/env python
+
+import configparser
+import requests
+import json
+import re
+import os
+import sqlite3
+from sys import argv, stderr, exit
+
+
+class Cache:
+    def __init__(self, dbpath='/tmp/heimdallr.db'):
+        if not os.path.exists(dbpath):
+           self.initialize(dbpath)
+        self.conn = sqlite3.connect(dbpath)
+
+    def initialize(self, dbpath):
+        conn = sqlite3.connect(dbpath)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE cache (key text primary key, etag text, value text)''')
+        conn.close()
+
+    def get(self, key):
+        c = self.conn.cursor()
+        c.execute("SELECT etag, value FROM cache WHERE key=?", (key,))
+        result = c.fetchone()
+        if result:
+            return dict(zip(['etag', 'value'], result))
+
+    def set(self, key, etag, value):
+        c = self.conn.cursor()
+        c.execute("INSERT OR REPLACE INTO cache (key, etag, value) VALUES (?, ?, ?)", (key, etag, value))
+        self.conn.commit()
+        return self
+
+
+def load_config():
+    config = configparser.ConfigParser(allow_no_value=True)
+    config.read([
+        os.path.abspath('heimdallr.conf'),
+        '/etc/heimdallr.conf'
+        ])
+    return config
+
+
+def get_provider_names(config):
+    return [x.strip() for x in config['DEFAULT']['providers'].strip().split()]
+
+
+def get_provider_methods(scope):
+    expr = re.compile('^provider_(.*)$')
+    providers = {}
+
+    for key in scope.keys():
+        match = expr.match(key)
+        if match:
+            providers[match.groups()[0]] = scope[key]
+
+    return providers
+
+
+def transform_key(key, template):
+    parts = key.split(' ')
+    keytypes = [
+        'ssh-rsa',
+        'ssh-dss',
+        'ssh-ed25519',
+        'ecdsa-sha2-nistp521',
+        'ecdsa-sha2-nistp384',
+        'ecdsa-sha2-nistp256'
+        ]
+
+    for keytype in keytypes:
+        if keytype in parts:
+            index = parts.index(keytype)
+            break
+
+    data = {}
+    data['options'] = '' if index > 0 else parts[0]
+    data['type'] = parts[index]
+    data['key'] = parts[index + 1]
+    data['note'] = parts[-1]
+
+    return template.format(**data)
+
+def provider_filesystem(user, userconfig, cache):
+    if 'filesystem' not in userconfig:
+        return []
+
+    path = userconfig['filesystem']
+
+    try:
+        fd = open(path, 'r')
+        lines = fd.readlines()
+        fd.close()
+    except FileNotFoundError:
+        err('filesystem: unable to find file "%s"' % path)
+
+    return lines
+
+
+def provider_github(user, userconfig, cache):
+    if 'github' in userconfig:
+        user = userconfig['github']
+        if not user:
+            return []
+
+    headers = {}
+    cachekey = 'github/' + user
+    cached = cache.get(cachekey)
+    if cached:
+        headers['if-none-match'] = cached['etag']
+
+    url = 'https://api.github.com/users/%s/keys' % user
+    resp = requests.get(url, headers=headers)
+
+    if resp.ok:
+        if resp.status_code == 304:
+            data = cached['value']
+        else:
+            data = resp.text
+            cache.set(cachekey, resp.headers['etag'], data)
+
+        data = json.loads(data)
+        return [x['key'] for x in data]
+
+    return []
+
+
+def provider_cache(user, userconfig, cache):
+    cache.set(user + '_cache', 'abcde', 'monkeybutt')
+
+    return []
+
+
+def run_checks(config, providers, provider_methods, cache):
+    # check that providers exist
+    for provider in providers:
+        print("checking provider '%s'" % provider)
+        if provider not in provider_methods:
+           err("unknown provider '%s' specified in providers list" % provider, 1)
+
+    # verify that at least one provider is in use
+    if not providers:
+        err("no providers are provided", 1)
+
+    # check all per-user configurations
+    for key in config.keys():
+        if key == 'DEFAULT':
+            continue
+
+        user = key
+        userconfig = config[key]
+        for item in userconfig.keys():
+            if item in providers:
+                provider_methods[item](user, userconfig, cache)
+
+    print('OK')
+    exit(0)
+
+
+def err(msg, code=None):
+    stderr.write(msg + '\n')
+    if code:
+        exit(code)
+
+
+def run(provider_methods):
+    config = load_config()
+    providers = get_provider_names(config)
+    cache = Cache(config['DEFAULT'].get('cache', '/tmp/heimdallr.db'))
+
+    if len(argv) <= 1:
+        err('error: please provide a username or --check to run tests', 1)
+
+    if argv[1] == '--check':
+        return run_checks(config, providers, provider_methods, cache)
+
+    user = argv[1]
+
+    if user in config:
+        userconfig = config[user]
+    else:
+        userconfig = None
+
+    keys = []
+    for provider in providers:
+        # get template if it exists
+        template = userconfig.get(provider + '_template', None)
+        template = config['DEFAULT'].get(provider + '_template', template)
+        if template:
+            keys += [transform_key(key, template) for key in provider_methods[provider](user, userconfig, cache)]
+        else:
+            keys += provider_methods[provider](user, userconfig, cache)
+
+    print('\n'.join(keys))
+
+
+if __name__ == '__main__':
+    run(get_provider_methods(locals()))
