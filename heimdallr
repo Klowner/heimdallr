@@ -10,32 +10,40 @@ from sys import argv, stderr, exit
 
 
 class Cache:
+    """Simple sqlite3 backed cache"""
+
     def __init__(self, dbpath='/tmp/heimdallr.db'):
         if not os.path.exists(dbpath):
-           self.initialize(dbpath)
+            self.initialize(dbpath)
         self.conn = sqlite3.connect(dbpath)
 
-    def initialize(self, dbpath):
+    @staticmethod
+    def initialize(dbpath):
+        "Create necessary sqlite3 tables"
         conn = sqlite3.connect(dbpath)
-        c = conn.cursor()
-        c.execute('''CREATE TABLE cache (key text primary key, etag text, value text)''')
+        cur = conn.cursor()
+        cur.execute('''CREATE TABLE cache (key text primary key, etag text, value text)''')
         conn.close()
 
     def get(self, key):
-        c = self.conn.cursor()
-        c.execute("SELECT etag, value FROM cache WHERE key=?", (key,))
-        result = c.fetchone()
+        "Get the cached etag and value dict specified by key"
+        cur = self.conn.cursor()
+        cur.execute("SELECT etag, value FROM cache WHERE key=?", (key,))
+        result = cur.fetchone()
         if result:
             return dict(zip(['etag', 'value'], result))
 
     def set(self, key, etag, value):
-        c = self.conn.cursor()
-        c.execute("INSERT OR REPLACE INTO cache (key, etag, value) VALUES (?, ?, ?)", (key, etag, value))
+        "Upsert etag and value specified by unique key"
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT OR REPLACE INTO cache (key, etag, value) VALUES (?, ?, ?)", (key, etag, value))
         self.conn.commit()
         return self
 
 
 def load_config():
+    """Get the heimdallr configuration file"""
     config = configparser.ConfigParser(allow_no_value=True)
     config.read([
         os.path.abspath('heimdallr.conf'),
@@ -45,10 +53,17 @@ def load_config():
 
 
 def get_provider_names(config):
+    """Get names of all providers specified for use by the configuration file"""
     return [x.strip() for x in config['DEFAULT']['providers'].strip().split()]
 
 
 def get_provider_methods(scope):
+    """Get a dictionary containing all provider names and providers
+
+    Simple introspection is performed and all functions with names that start with `provider_` are
+    added to the returned dictionary.  If a function named provider_github exists, then it will be
+    inserted into the dictionary as {'github': provider_github()}
+    """
     expr = re.compile('^provider_(.*)$')
     providers = {}
 
@@ -61,6 +76,19 @@ def get_provider_methods(scope):
 
 
 def transform_key(key, template):
+    """Parse a key entry and transform it by a provided template.
+
+    A single key is split up into 4 separate keywords: 'options', 'type', 'key', and 'note'.
+    The 'options' value is used for things such as 'command=""' or no-pty.
+    The 'type' value is the key format, such as 'ssh-rsa'.
+    The 'key' value is the actual key data.
+    The 'note' value is the optional key name that is sometimes appended, such as 'user@host'
+
+    Replacing options is sometimes helpful when working with upstream key providers such as an
+    authorized_keys file which is managed by a system such as Gitlab, where `command` options are
+    prepended.
+    """
+
     parts = key.split(' ')
     keytypes = [
         'ssh-rsa',
@@ -84,16 +112,24 @@ def transform_key(key, template):
 
     return template.format(**data)
 
+
 def provider_filesystem(user, userconfig, cache):
-    if 'filesystem' not in userconfig:
+    """Flat file provider
+
+    Helpful for reading an authorized_keys file in a non-standard location
+
+    The path specified by a user's `filesystem` entry will be read.
+    """
+
+    if 'filesystem' not in userconfig or not userconfig['filesystem']:
         return []
 
     path = userconfig['filesystem']
 
     try:
-        fd = open(path, 'r')
-        lines = fd.readlines()
-        fd.close()
+        srcfd = open(path, 'r')
+        lines = srcfd.readlines()
+        srcfd.close()
     except FileNotFoundError:
         err('filesystem: unable to find file "%s"' % path)
 
@@ -101,6 +137,13 @@ def provider_filesystem(user, userconfig, cache):
 
 
 def provider_github(user, userconfig, cache):
+    """Github user's public key registry provider
+
+    Github provides user's public keys through their API, this provider fetches all public keys for
+    a given user account.
+
+    """
+
     if 'github' in userconfig:
         user = userconfig['github']
         if not user:
@@ -128,8 +171,26 @@ def provider_github(user, userconfig, cache):
     return []
 
 
-def provider_cache(user, userconfig, cache):
-    cache.set(user + '_cache', 'abcde', 'monkeybutt')
+def provider_website(user, userconfig, cache):
+    if 'website' in userconfig:
+        url = userconfig['website']
+        if not url:
+            return []
+
+    headers = {}
+    cachekey = 'website/' + user
+    cached = cache.get(cachekey)
+    if cached:
+        headers['if-none-match'] = cached['etag']
+
+    resp = requests.get(url, headers=headers)
+
+    if resp.ok:
+        if resp.status_code == 304:
+            data = cached['value']
+        else:
+            data = resp.text
+        return [x.strip() for x in data.split('\n')]
 
     return []
 
@@ -178,11 +239,7 @@ def run(provider_methods):
         return run_checks(config, providers, provider_methods, cache)
 
     user = argv[1]
-
-    if user in config:
-        userconfig = config[user]
-    else:
-        userconfig = None
+    userconfig = config.get(user, None)
 
     keys = []
     for provider in providers:
@@ -199,3 +256,5 @@ def run(provider_methods):
 
 if __name__ == '__main__':
     run(get_provider_methods(locals()))
+
+# vim:cc=100:tw=100
