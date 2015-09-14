@@ -1,12 +1,11 @@
 #!/usr/bin/env python
-
 import configparser
 import requests
 import json
 import re
 import os
 import sqlite3
-from sys import argv, stderr, exit
+from sys import argv, stderr
 
 
 class Cache:
@@ -121,10 +120,10 @@ def provider_filesystem(user, userconfig, cache):
     The path specified by a user's `filesystem` entry will be read.
     """
 
-    if 'filesystem' not in userconfig or not userconfig['filesystem']:
-        return []
+    path = userconfig.get('filesystem', None)
 
-    path = userconfig['filesystem']
+    if not path:
+        return []
 
     try:
         srcfd = open(path, 'r')
@@ -144,10 +143,11 @@ def provider_github(user, userconfig, cache):
 
     """
 
-    if 'github' in userconfig:
-        user = userconfig['github']
-        if not user:
-            return []
+    # You can specify an alternate username for github keys
+    user = userconfig.get('github', user)
+
+    if not user:
+        return []
 
     headers = {}
     cachekey = 'github/' + user
@@ -172,10 +172,18 @@ def provider_github(user, userconfig, cache):
 
 
 def provider_website(user, userconfig, cache):
-    if 'website' in userconfig:
-        url = userconfig['website']
-        if not url:
-            return []
+    """Fetch some keys from a web resource.
+
+    Grab keys from a website, assuming you return one per line.
+
+    Set `website` in a user stanza to a URL to use.
+
+    It's probably wise to use https hosts and check the cert!
+    """
+
+    url = userconfig.get('website', None)
+    if not url:
+        return []
 
     headers = {}
     cachekey = 'website/' + user
