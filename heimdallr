@@ -85,7 +85,6 @@ def transform_key(key, template, user):
     prepended.
     """
 
-    print('transforming', key)
     parts = key.split(' ')
     keytypes = [
         'ssh-rsa',
@@ -259,7 +258,6 @@ def run(provider_methods):
         template = userconfig.get(provider + '_template', None)
         template = config['DEFAULT'].get(provider + '_template', template)
 
-        print(template, keys)
         if template:
             keys = [transform_key(key, template, user) for key in keys]
 
