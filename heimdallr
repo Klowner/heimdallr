@@ -50,7 +50,9 @@ class Cache:
 
 def get_userconfig_or_default(config, username, key, fallback=None):
     """Get the requested key from the specified user's config stanza or fallback to the DEFAULT"""
-    userconfig = config.get(username)
+
+    userconfig = config[username] if username in config else None
+
     if userconfig and key in userconfig:
         return userconfig[key]
     return config['DEFAULT'].get(key, fallback)
@@ -123,6 +125,8 @@ def provider_filename(user, userconfig, cache):
     if not path:
         return []
 
+    path = path.format(**{'user': user})
+
     try:
         src = open(path, 'r')
         lines = src.readlines()
@@ -174,7 +178,8 @@ def provider_website(user, userconfig, cache):
 
     Grab keys from a website, assuming you return one per line.
 
-    Set `website` in a user stanza to a URL to use.
+    Set `website` in a user stanza to a URL to use, or set `website` in
+    the DEFAULT stanza, {user} will be replaced with the authenticating user.
 
     It's probably wise to use https hosts and check the cert!
     """
@@ -183,6 +188,7 @@ def provider_website(user, userconfig, cache):
     if not url:
         return []
 
+    url = url.format(**{'user': user})
     headers = {}
     cachekey = 'website/' + user
     cached = cache.get(cachekey)
@@ -254,9 +260,7 @@ def run(provider_methods):
     for provider in providers:
         keys = provider_methods[provider](user, userconfig, cache)
 
-        # get template if it exists
-        template = userconfig.get(provider + '_template', None)
-        template = config['DEFAULT'].get(provider + '_template', template)
+        template = get_userconfig_or_default(config, user, provider + '_template', None)
 
         if template:
             keys = [transform_key(key, template, user) for key in keys]
