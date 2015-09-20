@@ -79,7 +79,7 @@ def transform_key(key, template, user):
     The 'options' value is used for things such as 'command=""' or no-pty.
     The 'type' value is the key format, such as 'ssh-rsa'.
     The 'key' value is the actual key data.
-    The 'note' value is the optional key name that is sometimes appended, such as 'user@host'
+    The 'comment' value is the optional key name that is sometimes appended, such as 'user@host'
     The 'user' value is the user attempting to auth
 
     Replacing options is sometimes helpful when working with upstream key providers such as an
@@ -106,7 +106,7 @@ def transform_key(key, template, user):
     data['options'] = '' if index > 0 else parts[0]
     data['type'] = parts[index]
     data['key'] = parts[index + 1]
-    data['note'] = parts[-1]
+    data['comment'] = parts[-1]
     data['user'] = user
 
     return template.format(**data)
@@ -126,13 +126,15 @@ def provider_filename(user, userconfig, cache):
         return []
 
     path = path.format(**{'user': user})
+    lines =[]
 
-    try:
-        src = open(path, 'r')
-        lines = src.readlines()
-        src.close()
-    except FileNotFoundError:
-        err('filesystem: unable to find file "%s"' % path)
+    for file_path in path.split('\n'):
+        try:
+            src = open(file_path, 'r')
+            lines = src.readlines()
+            src.close()
+        except FileNotFoundError:
+            err('filesystem: unable to find file "%s"' % file_path)
 
     return lines
 
@@ -146,10 +148,7 @@ def provider_github(user, userconfig, cache):
     """
 
     # You can specify an alternate username for github keys
-    user = userconfig.get('github', user)
-
-    if not user:
-        return []
+    user = userconfig['github'] or user
 
     headers = {}
     cachekey = 'github/' + user
@@ -240,8 +239,54 @@ def err(msg, code=None):
     if code:
         exit(code)
 
-
 def run(provider_methods):
+    """Iterate through the requested user's providers and output keys."""
+    config = load_config()
+    available_providers = provider_methods.keys()
+    default_config = config['DEFAULT']
+    cache = Cache(default_config.get('cache', '/tmp/heimdallr.db'))
+
+    if len(argv) <= 1:
+        err('error: please provide a username or --check to run tests', 1)
+
+    if argv[1] == '--check':
+        return run_checks(config, available_providers, provider_methods, cache)
+
+    user = argv[1]
+
+    user_config = config[user] if user in config else None
+
+    if user_config:
+        for provider in available_providers:
+            if provider in user_config:
+                keys = provider_methods[provider](user, user_config, cache)
+                template_name = provider + '_template'
+                template = user_config.get(template_name, default_config.get(template_name, None))
+
+                if template:
+                    keys = [transform_key(key, template, user) for key in keys]
+
+                for key in keys:
+                    stdout.write(key + '\n')
+
+    else:
+        for provider in available_providers:
+            if provider in default_config:
+                keys = provider_methods[provider](user, default_config, cache)
+                template_name = provider + '_template'
+                template = default_config.get(template_name, None)
+
+                if template:
+                    keys = [transform_key(key, template, user) for key in keys]
+
+                for key in keys:
+                    stdout.write(key + '\n')
+    exit(0)
+
+
+
+
+def runold(provider_methods):
     """Iterate through providers (in order) and output keys."""
     config = load_config()
     providers = get_provider_names(config)
