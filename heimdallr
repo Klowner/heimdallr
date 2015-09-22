@@ -8,7 +8,7 @@ to read public keys from a variety of configurable sources.
 """
 
 import configparser
-import requests
+import urllib.request
 import json
 import os
 import sqlite3
@@ -46,6 +46,19 @@ class Cache:
             "INSERT OR REPLACE INTO cache (key, etag, value) VALUES (?, ?, ?)", (key, etag, value))
         self.conn.commit()
         return self
+
+def get_url(url, headers):
+    """Get requested url, returning (code, response)"""
+    request = urllib.request.Request(url, None, headers)
+    try:
+        response = urllib.request.urlopen(request)
+    except urllib.error.HTTPError as exception:
+        if exception.code == 304:
+            return exception.code, None
+
+        raise exception
+
+    return response.code, response
 
 
 def get_userconfig_or_default(config, username, key, fallback=None):
@@ -126,16 +139,23 @@ def provider_filename(user, userconfig, cache):
         return []
 
     path = path.format(**{'user': user})
-    lines =[]
+    lines = []
 
-    for file_path in path.split('\n'):
-        try:
+    for file_path in path.strip().split('\n'):
+        cachekey = 'filename/' + file_path
+        cached = cache.get(cachekey)
+        stat = os.stat(file_path)
+        etag = "%dmt" % (stat.st_mtime * 1000)
+
+        if cached and cached['etag'] == etag:
+            data = cached['value']
+            file_lines = [line.strip() for line in data.split('\n')]
+        else:
             src = open(file_path, 'r')
-            lines = src.readlines()
+            file_lines = [line.strip() for line in src.readlines()]
             src.close()
-        except FileNotFoundError:
-            err('filesystem: unable to find file "%s"' % file_path)
-
+            cache.set(cachekey, etag, '\n'.join(file_lines))
+        lines += file_lines
     return lines
 
 
@@ -157,16 +177,17 @@ def provider_github(user, userconfig, cache):
         headers['if-none-match'] = cached['etag']
 
     url = 'https://api.github.com/users/%s/keys' % user
-    resp = requests.get(url, headers=headers)
 
-    if resp.ok:
-        if resp.status_code == 304:
-            data = cached['value']
-        else:
-            data = resp.text
-            cache.set(cachekey, resp.headers['etag'], data)
+    code, response = get_url(url, headers)
 
-        data = json.loads(data)
+    if code == 304:
+        data = cached['value']
+    else:
+        data = response.readall()
+        cache.set(cachekey, response.headers.get('etag'), data)
+
+    if data:
+        data = json.loads(data.decode('utf-8'))
         return [x['key'] for x in data]
 
     return []
@@ -194,13 +215,17 @@ def provider_website(user, userconfig, cache):
     if cached:
         headers['if-none-match'] = cached['etag']
 
-    resp = requests.get(url, headers=headers)
+    #resp = requests.get(url, headers=headers)
+    code, response = get_url(url, headers)
 
-    if resp.ok:
-        if resp.status_code == 304:
+    if code >= 200 and code < 400:
+        if code is 304:
             data = cached['value']
         else:
-            data = resp.text
+            data = response.readall()
+            cache.set(cachekey, response.headers.get('etag'), data)
+
+    if data:
         return [x.strip() for x in data.split('\n')]
 
     return []
@@ -243,8 +268,11 @@ def run(provider_methods):
     """Iterate through the requested user's providers and output keys."""
     config = load_config()
     available_providers = provider_methods.keys()
-    default_config = config['DEFAULT']
-    cache = Cache(default_config.get('cache', '/tmp/heimdallr.db'))
+
+    if config.has_option('DEFAULT', 'cache'):
+        cache = Cache(config.get('DEFAULT', 'cache'))
+    else:
+        cache = Cache('/tmp/heimdallr.db')
 
     if len(argv) <= 1:
         err('error: please provide a username or --check to run tests', 1)
@@ -254,63 +282,22 @@ def run(provider_methods):
 
     user = argv[1]
 
-    user_config = config[user] if user in config else None
+    config_section = 'DEFAULT'
+    if user in config.sections():
+        config_section = user
 
-    if user_config:
-        for provider in available_providers:
-            if provider in user_config:
-                keys = provider_methods[provider](user, user_config, cache)
-                template_name = provider + '_template'
-                template = user_config.get(template_name, default_config.get(template_name, None))
+    for provider in available_providers:
+        if config.has_option(config_section, provider):
+            keys = provider_methods[provider](user, config[config_section], cache)
 
-                if template:
-                    keys = [transform_key(key, template, user) for key in keys]
+            template_name = provider + '_template'
+            if config.has_option(config_section, template_name):
+                template = config.get(config_section, provider + '_template')
+                keys = [transform_key(key, template, user) for key in keys]
 
-                for key in keys:
-                    stdout.write(key + '\n')
+            for key in keys:
+                stdout.write(key + '\n')
 
-    else:
-        for provider in available_providers:
-            if provider in default_config:
-                keys = provider_methods[provider](user, default_config, cache)
-                template_name = provider + '_template'
-                template = default_config.get(template_name, None)
-
-                if template:
-                    keys = [transform_key(key, template, user) for key in keys]
-
-                for key in keys:
-                    stdout.write(key + '\n')
-    exit(0)
-
-
-
-
-def runold(provider_methods):
-    """Iterate through providers (in order) and output keys."""
-    config = load_config()
-    providers = get_provider_names(config)
-    cache = Cache(config['DEFAULT'].get('cache', '/tmp/heimdallr.db'))
-
-    if len(argv) <= 1:
-        err('error: please provide a username or --check to run tests', 1)
-
-    if argv[1] == '--check':
-        return run_checks(config, providers, provider_methods, cache)
-
-    user = argv[1]
-
-    userconfig = config[user] if user in config else None
-
-    for provider in providers:
-        keys = provider_methods[provider](user, userconfig, cache)
-
-        template = get_userconfig_or_default(config, user, provider + '_template', None)
-
-        if template:
-            keys = [transform_key(key, template, user) for key in keys]
-
-        stdout.write('\n'.join(keys) + '\n')
 
 
 if __name__ == '__main__':
